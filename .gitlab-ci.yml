@@ -1,0 +1,91 @@
+stages:
+  - build
+  - deploy
+
+# ─── FRONTEND ────────────────────────────────────────────────────────────────
+
+build:client:
+  stage: build
+  image: node:20-alpine
+  cache:
+    key: client-$CI_COMMIT_REF_SLUG
+    paths:
+      - client/node_modules/
+  script:
+    - cd client
+    - npm ci
+    - npm run build        # outputs to client/dist/
+  artifacts:
+    paths:
+      - client/dist/
+    expire_in: 1 hour
+  only:
+    - main
+
+# GitLab Pages — must be a job named exactly "pages"
+pages:
+  stage: deploy
+  dependencies:
+    - build:client
+  script:
+    - mv client/dist public   # GitLab Pages serves from /public
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+
+# ─── BACKEND ─────────────────────────────────────────────────────────────────
+
+build:server:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    IMAGE: $CI_REGISTRY_IMAGE/server:$CI_COMMIT_SHORT_SHA
+    IMAGE_LATEST: $CI_REGISTRY_IMAGE/server:latest
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $IMAGE -t $IMAGE_LATEST -f server/Dockerfile server/
+    - docker push $IMAGE
+    - docker push $IMAGE_LATEST
+  only:
+    - main
+
+deploy:server:
+  stage: deploy
+  image: alpine:3.20
+  dependencies:
+    - build:server
+  variables:
+    IMAGE_LATEST: $CI_REGISTRY_IMAGE/server:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh $DEPLOY_USER@$DEPLOY_HOST "
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY &&
+        docker pull $IMAGE_LATEST &&
+        docker stop doc-server || true &&
+        docker rm doc-server || true &&
+        docker run -d --name doc-server --restart unless-stopped \
+          -p 4000:4000 \
+          -e DATABASE_URL='$DATABASE_URL' \
+          -e JWT_SECRET='$JWT_SECRET' \
+          -e JWT_EXPIRES_IN='$JWT_EXPIRES_IN' \
+          -e OLLAMA_URL='$OLLAMA_URL' \
+          -e EMBED_MODEL='$EMBED_MODEL' \
+          -e LLM_MODEL='$LLM_MODEL' \
+          -e MIN_SCORE='$MIN_SCORE' \
+          -e CLIENT_ORIGIN='$CLIENT_ORIGIN' \
+          -e TRUST_PROXY='1' \
+          -e PORT='4000' \
+          $IMAGE_LATEST
+      "
+  only:
+    - main
